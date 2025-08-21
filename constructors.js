@@ -2,6 +2,13 @@ class Wall {
   constructor(x1, y1, x2, y2) {
     this.start = { x: x1, y: y1 };
     this.end = { x: x2, y: y2 };
+
+    // Precompute AABB for broad-phase checks
+    const minX = Math.min(x1, x2);
+    const minY = Math.min(y1, y2);
+    const maxX = Math.max(x1, x2);
+    const maxY = Math.max(y1, y2);
+    this.aabb = { minX, minY, maxX, maxY };
   }
 
   render() {
@@ -23,26 +30,28 @@ class Particle {
     this.sensor.getIntersection(wall);
   }
 
-  update() {
+  update(walls) {
     this.position.x += this.velocity.x;
     this.position.y += this.velocity.y;
-    if (this.position.x > width - 3 || this.position.x < 3) this.velocity.x *= -1;
-    if (this.position.y > height - 3 || this.position.y < 3) this.velocity.y *= -1;
     this.sensor.startPoint = this.position;
 
-    for (let i = 0; i < this.sensor.rayCount; i++) {
-      const angle = lerp(
-        -this.sensor.spread / 2 + PI / this.sensor.rayCount,
-        this.sensor.spread / 2 - PI / this.sensor.rayCount,
-        this.sensor.rayCount == 1 ? 1 : i / (this.sensor.rayCount - 1)
+    // Check collision with each wall
+    for (let wall of walls) {
+      const collision = circleLineCollision(
+        { x: this.position.x, y: this.position.y, r: this.radius },
+        wall
       );
-      this.sensor.rayEndPoints[i] = {
-        x: this.sensor.startPoint.x + cos(angle) * this.sensor.rayLenth,
-        y: this.sensor.startPoint.y + sin(angle) * this.sensor.rayLenth,
-      };
+      if (collision.hit) {
+        this.velocity = reflectVelocity(this.velocity, wall);
+
+        // Push particle slightly outside wall to prevent sticking
+        this.position.x += this.velocity.x;
+        this.position.y += this.velocity.y;
+      }
     }
 
-    this.sensor.intersections = [];
+    // Reset intersections/minT for this frame (directions are precomputed once)
+    this.sensor.resetFrame();
   }
 
   render() {
@@ -56,66 +65,119 @@ class Rays {
     this.rayCount = rayCount;
     this.startPoint = position;
     this.spread = PI * 2;
-    this.rayEndPoints = [];
 
-    this.rayLenth = 100; //temp
-    this.intersections = [];
+    this.rayLength = 150; // max ray length
+
+    // Precompute direction unit vectors for all rays (no trig per frame)
+    this.dirX = new Float32Array(rayCount);
+    this.dirY = new Float32Array(rayCount);
+    for (let i = 0; i < rayCount; i++) {
+      const t = this.rayCount == 1 ? 1 : i / (this.rayCount - 1);
+      const angle = lerp(
+        -this.spread / 2 + PI / this.rayCount,
+        this.spread / 2 - PI / this.rayCount,
+        t
+      );
+      this.dirX[i] = cos(angle);
+      this.dirY[i] = sin(angle);
+    }
+
+    // Per-frame state
+    this.intersections = new Array(rayCount); // {x,y} or undefined
+    this.minT = new Float32Array(rayCount); // closest t in [0,1]
+    this.resetFrame();
+  }
+
+  // Clear per-frame buffers
+  resetFrame() {
+    for (let i = 0; i < this.rayCount; i++) {
+      this.intersections[i] = undefined;
+      this.minT[i] = Infinity;
+    }
+  }
+
+  // Simple AABB overlap check for broad-phase culling
+  static _aabbOverlap(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1) {
+    return ax0 <= bx1 && ax1 >= bx0 && ay0 <= by1 && ay1 >= by0;
   }
 
   getIntersection(wall) {
-    this.rayEndPoints.forEach((endPoint, i) => {
-      const x1 = this.startPoint.x;
-      const y1 = this.startPoint.y;
-      const x2 = endPoint.x;
-      const y2 = endPoint.y;
-      const x3 = wall.start.x;
-      const y3 = wall.start.y;
-      const x4 = wall.end.x;
-      const y4 = wall.end.y;
+    const x1 = this.startPoint.x;
+    const y1 = this.startPoint.y;
 
+    const x3 = wall.start.x;
+    const y3 = wall.start.y;
+    const x4 = wall.end.x;
+    const y4 = wall.end.y;
+
+    const wAABB = wall.aabb;
+
+    for (let i = 0; i < this.rayCount; i++) {
+      // If we already found a hit with t == 0, can't get closer
+      if (this.minT[i] === 0) continue;
+
+      // End point for this ray segment (for broad-phase + rendering fallback)
+      const dx = this.dirX[i] * this.rayLength;
+      const dy = this.dirY[i] * this.rayLength;
+      const x2 = x1 + dx;
+      const y2 = y1 + dy;
+
+      // Broad-phase AABB test: skip if no overlap
+      const minX = x1 < x2 ? x1 : x2;
+      const minY = y1 < y2 ? y1 : y2;
+      const maxX = x1 > x2 ? x1 : x2;
+      const maxY = y1 > y2 ? y1 : y2;
+      if (
+        !Rays._aabbOverlap(
+          minX,
+          minY,
+          maxX,
+          maxY,
+          wAABB.minX,
+          wAABB.minY,
+          wAABB.maxX,
+          wAABB.maxY
+        )
+      ) {
+        continue;
+      }
+
+      // Line-line intersection (segment x1->x2 with segment x3->x4)
       const denominator = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
-      if (denominator == 0) return this.intersections[i];
-      const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denominator;
-      const u = ((x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2)) / denominator;
+      if (denominator === 0) continue; // Parallel
 
-      if (t > 0 && u > 0 && u < 1) {
-        const x = x1 + t * (x2 - x1);
-        const y = y1 + t * (y2 - y1);
-        if (
-          !this.intersections[i] ||
-          dist(x1, y1, x, y) < dist(x1, y1, this.intersections[i].x, this.intersections[i].y)
-        ) {
-          this.intersections[i] = { x: x, y: y };
+      const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denominator; // on ray
+      const u = ((x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2)) / denominator; // on wall
+
+      // We want intersection within our finite ray segment [0,1] and wall segment [0,1]
+      if (t > 0 && t <= 1 && u >= 0 && u <= 1) {
+        if (t < this.minT[i]) {
+          this.minT[i] = t;
+          this.intersections[i] = {
+            x: x1 + t * dx,
+            y: y1 + t * dy,
+          };
+
+          // If we hit very close to origin, no closer hit possible
+          if (t <= 1e-6) {
+            this.minT[i] = 0;
+          }
         }
       }
-    });
+    }
   }
 
   render() {
     stroke(255, 50);
     for (let i = 0; i < this.rayCount; i++) {
-      if (this.intersections[i])
+      if (this.intersections[i]) {
         line(
           this.startPoint.x,
           this.startPoint.y,
           this.intersections[i].x,
           this.intersections[i].y
         );
+      }
     }
   }
-}
-
-//Utility function
-function detectIntersection(A, B, C, D) {
-  const tTop = (D.x - C.x) * (A.y - C.y) - (D.y - C.y) * (A.x - C.x);
-  const uTop = (C.y - A.y) * (A.x - B.x) - (C.x - A.x) * (A.y - B.y);
-  const bottom = (D.y - C.y) * (B.x - A.x) - (D.x - C.x) * (B.y - A.y);
-
-  if (bottom != 0) {
-    const t = tTop / bottom;
-    const u = uTop / bottom;
-    return t >= 0 && t <= 1 && u >= 0 && u <= 1;
-  }
-
-  return true;
 }
